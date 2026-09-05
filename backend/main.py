@@ -9618,6 +9618,414 @@ def _jsonl_events(path: Path) -> List[Dict[str, Any]]:
     return events
 
 
+# --------------------------------------------------------------------------- #
+# Session export
+#
+# "Export" means: hand back the file the trace is read FROM, byte for byte.
+# Three things stop that from being one code path:
+#
+#   1. Not every agent has a file. Hermes and OpenCode keep sessions as rows in
+#      a database shared with every other session, so there is nothing to copy —
+#      we serialize the rows and say plainly that the result is a reconstruction.
+#   2. Some agents spread one session over several files (Grok's summary +
+#      chat history + events; Cline's DB row + external transcript), which
+#      travel together as a zip.
+#   3. In a container the source may not be readable at all. compose.yml mounts
+#      agent directories read-only and ships with only ~/.claude uncommented, so
+#      most agents resolve to nothing. That is a distinct answer with a fixable
+#      cause, not a "session not found".
+#
+# The resolver takes (agent, session_id) and never a caller-supplied path, so
+# unlike /artifacts it widens nothing: a caller can only ever reach the source
+# of a session that already exists.
+# --------------------------------------------------------------------------- #
+
+_EXPORT_KIND_FILE = "file"                # one file, streamable verbatim
+_EXPORT_KIND_FILES = "files"              # several files -> zip
+_EXPORT_KIND_SERIALIZED = "serialized"    # rows in a shared DB -> reconstruction
+_EXPORT_KIND_UNAVAILABLE = "unavailable"  # nothing readable from here
+
+# Agents whose sessions live as rows in a database shared with other sessions.
+# Copying the DB would hand over every other session in it, so these serialize.
+_EXPORT_SERIALIZED_AGENTS = {"hermes", "opencode"}
+
+
+def _export_unavailable(agent: str, reason: str) -> Dict[str, Any]:
+    return {
+        "kind": _EXPORT_KIND_UNAVAILABLE,
+        "paths": [],
+        "reason": reason,
+        # Containers are the common cause and the fix is a one-line mount, so
+        # say so rather than leaving the user to guess.
+        "hint": (
+            f"If TokenTelemetry runs in a container, {agent}'s directory may not "
+            f"be mounted — uncomment its line under `volumes:` in compose.yml and "
+            f"restart. Otherwise the session's files may have been deleted or "
+            f"rotated away."
+        ),
+    }
+
+
+def _export_files(paths: List[Path]) -> Dict[str, Any]:
+    live = [p for p in paths if p and p.exists() and p.is_file()]
+    if not live:
+        return {}
+    kind = _EXPORT_KIND_FILE if len(live) == 1 else _EXPORT_KIND_FILES
+    return {"kind": kind, "paths": live, "reason": None, "hint": None}
+
+
+def _session_source(agent: str, session_id: str) -> Dict[str, Any]:
+    """Locate the on-disk source the trace for this session is read from.
+
+    Mirrors get_session_detail's resolution per agent — same globs, same
+    precedence — so the export is the file the UI is actually reading, not a
+    lookalike found by a second, subtly different search.
+    """
+    try:
+        if agent == "claude":
+            hits = (list(CLAUDE_DIR.glob(f"projects/**/{session_id}.jsonl"))
+                    or list(CLAUDE_DIR.glob(f"sessions/{session_id}.json")))
+            return _export_files(hits[:1]) or _export_unavailable(agent, "no session file found")
+
+        if agent == "codex":
+            hits = list(CODEX_DIR.glob(f"sessions/**/rollout-*{session_id}*.jsonl"))
+            return _export_files(hits[:1]) or _export_unavailable(agent, "no rollout file found")
+
+        if agent == "grok":
+            # A directory per session: summary + dialogue + lifecycle events.
+            for bucket in GROK_SESSIONS_DIR.glob("*"):
+                cand = bucket / session_id
+                if cand.is_dir() and (cand / GROK_SUMMARY).exists():
+                    return _export_files(sorted(p for p in cand.iterdir() if p.is_file())) \
+                        or _export_unavailable(agent, "session directory is empty")
+            return _export_unavailable(agent, "no session directory found")
+
+        if agent == "pi":
+            if PI_SESSIONS_DIR.exists():
+                for bucket in PI_SESSIONS_DIR.iterdir():
+                    if not bucket.is_dir():
+                        continue
+                    match = list(bucket.glob(f"*{session_id}*.jsonl"))
+                    if match:
+                        return _export_files(match[:1])
+            return _export_unavailable(agent, "no session file found")
+
+        if agent == "dsh":
+            # zstd-compressed JSONL. Exported compressed, exactly as stored —
+            # decompressing would make it a different file than the source.
+            return _export_files([_dsh_session_file(session_id)]) \
+                or _export_unavailable(agent, "no session file found")
+
+        if agent == "qoder":
+            return _export_files([_qoder_session_file(session_id)]) \
+                or _export_unavailable(agent, "no session file found")
+
+        if agent == "antigravity":
+            # The CLI keeps one DB per conversation, so the whole file belongs
+            # to this session and is safe to hand over intact.
+            cli_db = ANTIGRAVITY_CLI_DIR / "conversations" / f"{session_id}.db"
+            found = _export_files([cli_db])
+            if found:
+                return found
+            # Brain-backed sessions are a directory of markdown artifacts.
+            brain_dir = ANTIGRAVITY_BRAIN_DIR / session_id
+            for _bd in ANTIGRAVITY_BRAIN_DIRS:
+                if (_bd / session_id).is_dir():
+                    brain_dir = _bd / session_id
+                    break
+            if brain_dir.is_dir():
+                return _export_files(sorted(p for p in brain_dir.iterdir() if p.is_file())) \
+                    or _export_unavailable(agent, "brain directory is empty")
+            return _export_unavailable(agent, "no conversation DB or brain directory found")
+
+        if agent == "gemini":
+            hits = (list((GEMINI_DIR / "tmp").glob(f"**/chats/session-*{session_id[:8]}*.json*"))
+                    or list((GEMINI_DIR / "tmp").glob(f"**/chats/*{session_id}*.json*")))
+            return _export_files(hits[:1]) or _export_unavailable(agent, "no chat file found")
+
+        if agent == "muse":
+            path = next((p for p in MUSE_SESSIONS_DIR.glob("*/*/*/*/session.jsonl")
+                         if p.parent.name == session_id), None)
+            return _export_files([path]) or _export_unavailable(agent, "no session file found")
+
+        if agent == "prime":
+            # Prime files aren't named by id — the id is in a "session" header
+            # row, so the file has to be opened to be identified.
+            for candidate in PRIME_SESSIONS_DIR.glob("*.jsonl"):
+                try:
+                    with open(candidate, "r", encoding="utf-8", errors="replace") as f:
+                        rows = [json.loads(line) for line in f if line.strip()]
+                except (OSError, json.JSONDecodeError, ValueError):
+                    continue
+                header = next((r for r in rows
+                               if isinstance(r, dict) and r.get("type") == "session"), None)
+                if isinstance(header, dict) and header.get("id") == session_id:
+                    return _export_files([candidate])
+            return _export_unavailable(agent, "no session file found")
+
+        if agent == "qwen":
+            hits = list(QWEN_DIR.glob(f"projects/**/chats/{session_id}.jsonl"))
+            return _export_files(hits[:1]) or _export_unavailable(agent, "no chat file found")
+
+        if agent == "vibe":
+            hits = list(VIBE_DIR.glob(f"logs/session/*{session_id}*.json"))
+            if not hits:
+                short = session_id.split("-")[0]
+                hits = list(VIBE_DIR.glob(f"logs/session/*{short}*.json"))
+            if not hits:
+                for cf in (VIBE_DIR / "logs" / "session").glob("*.json"):
+                    try:
+                        with open(cf, "r", encoding="utf-8", errors="replace") as f:
+                            if json.load(f).get("metadata", {}).get("session_id") == session_id:
+                                hits = [cf]
+                                break
+                    except Exception:
+                        continue
+            return _export_files(hits[:1]) or _export_unavailable(agent, "no session file found")
+
+        if agent == "cursor":
+            hits = list((CURSOR_DIR / "projects").glob(
+                f"**/agent-transcripts/{session_id}/{session_id}.jsonl"))
+            return _export_files(hits[:1]) or _export_unavailable(agent, "no transcript found")
+
+        if agent == "copilot":
+            cli_file = COPILOT_CLI_DIR / session_id / "events.jsonl"
+            found = _export_files([cli_file])
+            if found:
+                return found
+            hits = (list(VSCODE_STORAGE.glob(f"**/chatSessions/{session_id}.json"))
+                    + list(VSCODE_STORAGE.glob(f"**/chatSessions/{session_id}.jsonl")))
+            return _export_files(hits[:1]) or _export_unavailable(agent, "no session file found")
+
+        if agent == "smallcode":
+            roots: List[str] = list(SMALLCODE_EXTRA_ROOTS)
+            for s in (_sessions_cache.get("data") or []):
+                if s.get("agent") == "smallcode" and s.get("project"):
+                    roots.append(s["project"])
+            for root in dict.fromkeys(roots):
+                p = Path(root).expanduser() / ".smallcode" / "traces" / f"{session_id}.json"
+                found = _export_files([p])
+                if found:
+                    return found
+            return _export_unavailable(agent, "no trace file found")
+
+        if agent == "cline":
+            # The transcript is a real file, but the session row that points at
+            # it lives in a DB shared with every other Cline session — so the
+            # transcript exports as a file and the row rides along serialized.
+            db_path = CLINE_DIR / "data" / "db" / "sessions.db"
+            if db_path.exists():
+                try:
+                    conn = sqlite3.connect(_sqlite_ro_uri(db_path), uri=True, timeout=1.0)
+                    conn.row_factory = sqlite3.Row
+                    try:
+                        srow = conn.execute(
+                            "SELECT messages_path FROM sessions WHERE session_id=?",
+                            (session_id,)).fetchone()
+                    finally:
+                        conn.close()
+                    if srow and srow["messages_path"]:
+                        found = _export_files([Path(srow["messages_path"])])
+                        if found:
+                            return found
+                except Exception:
+                    pass
+            transcript = CLINE_VSCODE_DIR / "tasks" / session_id / "api_conversation_history.json"
+            return _export_files([transcript]) or _export_unavailable(agent, "no transcript found")
+
+        if agent in _EXPORT_SERIALIZED_AGENTS:
+            return {"kind": _EXPORT_KIND_SERIALIZED, "paths": [], "reason": None, "hint": None}
+
+    except Exception as e:
+        return _export_unavailable(agent, f"could not resolve source ({type(e).__name__})")
+
+    return _export_unavailable(agent, f"export is not implemented for agent '{agent}'")
+
+
+def _serialize_db_session(agent: str, session_id: str) -> Optional[Dict[str, Any]]:
+    """Rebuild a session that exists only as rows in a shared database.
+
+    This is NOT the source file — there isn't one. The payload says so in
+    `_source`, and the endpoint says so again in the filename, so a
+    reconstruction is never mistaken for a byte-for-byte copy.
+    """
+    def _envelope(rows: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "_source": "reconstructed",
+            "_note": (
+                f"{agent} stores sessions as rows in a database shared with "
+                f"every other session, so no single source file exists. These "
+                f"are this session's rows, verbatim, as TokenTelemetry reads them."
+            ),
+            "_agent": agent,
+            "_session_id": session_id,
+            "_exported_at": datetime.now(timezone.utc).isoformat(),
+            **rows,
+        }
+
+    if agent == "hermes":
+        for db_path in _hermes_dbs():
+            try:
+                conn = sqlite3.connect(_sqlite_ro_uri(db_path), uri=True, timeout=1.0)
+                conn.row_factory = sqlite3.Row
+                try:
+                    srow = conn.execute(
+                        "SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
+                    if not srow:
+                        continue
+                    msgs = conn.execute(
+                        "SELECT * FROM messages WHERE session_id=? ORDER BY timestamp",
+                        (session_id,)).fetchall()
+                    return _envelope({
+                        "session": dict(srow),
+                        "messages": [dict(m) for m in msgs],
+                    })
+                finally:
+                    conn.close()
+            except Exception:
+                continue
+        return None
+
+    if agent == "opencode":
+        db = _opencode_db_for_session(session_id)
+        if db is None:
+            return None
+        try:
+            conn = sqlite3.connect(_sqlite_ro_uri(db), uri=True, timeout=1.0)
+            conn.row_factory = sqlite3.Row
+            try:
+                srow = conn.execute(
+                    "SELECT * FROM session WHERE id=?", (session_id,)).fetchone()
+                if not srow:
+                    return None
+                msgs = conn.execute(
+                    "SELECT * FROM message WHERE session_id=? ORDER BY time_created",
+                    (session_id,)).fetchall()
+                parts = conn.execute(
+                    "SELECT * FROM part WHERE session_id=? ORDER BY time_created",
+                    (session_id,)).fetchall()
+                return _envelope({
+                    "session": dict(srow),
+                    "messages": [dict(m) for m in msgs],
+                    "parts": [dict(p) for p in parts],
+                })
+            finally:
+                conn.close()
+        except Exception:
+            return None
+
+    return None
+
+
+def _safe_session_stem(agent: str, session_id: str) -> str:
+    """Filename stem for a download. Session ids reach us from disk, so strip
+    anything that could steer a Content-Disposition filename."""
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", session_id)[:80] or "session"
+    return f"{agent}-{safe}"
+
+
+@app.get("/sessions/{session_id}/export-info")
+async def session_export_info(session_id: str, agent: str):
+    """What an export of this session would produce, without producing it.
+
+    Lets the UI show the real source path (and, when there isn't one, the
+    reason) before the user commits to a download.
+    """
+    src = _session_source(agent, session_id)
+    paths = src.get("paths") or []
+    if src["kind"] == _EXPORT_KIND_SERIALIZED:
+        available = _serialize_db_session(agent, session_id) is not None
+        if not available:
+            src = _export_unavailable(agent, "session rows not found in the database")
+            paths = []
+    return {
+        "session_id": session_id,
+        "agent": agent,
+        "kind": src["kind"],
+        "reason": src.get("reason"),
+        "hint": src.get("hint"),
+        # Absolute paths as the BACKEND sees them. In a container these are
+        # container paths (/root/.claude/…) and won't exist on the host, which
+        # is exactly why the download streams bytes instead of handing over a
+        # path to copy.
+        "paths": [str(p) for p in paths],
+        "bytes": sum((p.stat().st_size for p in paths if p.exists()), 0) or None,
+        "filename": _export_filename(agent, session_id, src),
+    }
+
+
+def _export_filename(agent: str, session_id: str, src: Dict[str, Any]) -> Optional[str]:
+    stem = _safe_session_stem(agent, session_id)
+    if src["kind"] == _EXPORT_KIND_FILE:
+        # Keep the source's own suffixes (.jsonl, .jsonl.zst, .db) so the file
+        # stays recognisable — and, for dsh, still decompressible.
+        return f"{stem}{''.join(Path(src['paths'][0]).suffixes[-2:])}"
+    if src["kind"] == _EXPORT_KIND_FILES:
+        return f"{stem}.zip"
+    if src["kind"] == _EXPORT_KIND_SERIALIZED:
+        return f"{stem}.reconstructed.json"
+    return None
+
+
+@app.get("/sessions/{session_id}/export")
+async def session_export(session_id: str, agent: str):
+    """Download this session's source.
+
+    A single file streams verbatim; several files travel as a zip; a DB-backed
+    session comes back as a labelled reconstruction. Nothing is rewritten — an
+    exported trace still carries absolute paths, cwd, and anything else that
+    passed through tool output, so treat it as sensitive before sharing it.
+    """
+    import io
+    import zipfile
+    from fastapi import HTTPException
+    from fastapi.responses import FileResponse, Response
+
+    src = _session_source(agent, session_id)
+    kind = src["kind"]
+
+    if kind == _EXPORT_KIND_SERIALIZED:
+        payload = _serialize_db_session(agent, session_id)
+        if payload is None:
+            raise HTTPException(status_code=404, detail="session rows not found")
+        body = json.dumps(payload, indent=2, default=str).encode("utf-8")
+        return Response(
+            content=body,
+            media_type="application/json",
+            headers={"Content-Disposition":
+                     f'attachment; filename="{_export_filename(agent, session_id, src)}"'},
+        )
+
+    if kind == _EXPORT_KIND_FILE:
+        path = Path(src["paths"][0])
+        return FileResponse(
+            str(path),
+            media_type="application/octet-stream",
+            filename=_export_filename(agent, session_id, src),
+        )
+
+    if kind == _EXPORT_KIND_FILES:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for p in src["paths"]:
+                try:
+                    zf.write(p, arcname=Path(p).name)
+                except Exception:
+                    continue
+        return Response(
+            content=buf.getvalue(),
+            media_type="application/zip",
+            headers={"Content-Disposition":
+                     f'attachment; filename="{_export_filename(agent, session_id, src)}"'},
+        )
+
+    raise HTTPException(
+        status_code=404,
+        detail={"error": src.get("reason") or "no exportable source",
+                "hint": src.get("hint")},
+    )
+
+
 _SUBAGENT_ID_RE = re.compile(r"^[\w.-]+$")
 
 

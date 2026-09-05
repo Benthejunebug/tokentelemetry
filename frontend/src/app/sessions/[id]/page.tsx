@@ -14,6 +14,7 @@ import CopilotSourceBadge from "@/components/CopilotSourceBadge";
 import AntigravitySourceBadge from "@/components/AntigravitySourceBadge";
 import SummaryPanel from "@/components/summarizer/SummaryPanel";
 import SessionLinksPanel from "@/components/SessionLinksPanel";
+import ExportSessionButton from "@/components/ExportSessionButton";
 import { apiFetch, artifactUrl } from "@/lib/api";
 import { formatTokens, formatCost } from "@/lib/format";
 import { timeAgo } from "@/lib/notifications";
@@ -1210,6 +1211,7 @@ export default function SessionDetailPage() {
                   )}
                 </div>
               )}
+              {agent && <ExportSessionButton sessionId={id} agent={agent} />}
               <Button
                 variant={splitView ? "primary" : "secondary"}
                 size="md"

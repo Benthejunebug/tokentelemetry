@@ -108,6 +108,32 @@ export function artifactUrl(path: string): string {
   return `${base}${sep}token=${encodeURIComponent(token)}`;
 }
 
+/** What exporting a session would produce, resolved by the backend. */
+export type SessionExportInfo = {
+  session_id: string;
+  agent: string;
+  /** file: one source file, verbatim. files: several, zipped. serialized: no
+   *  file exists (rows in a shared DB), so the download is a reconstruction.
+   *  unavailable: nothing readable from where the backend runs. */
+  kind: "file" | "files" | "serialized" | "unavailable";
+  reason: string | null;
+  hint: string | null;
+  /** Absolute paths as the BACKEND sees them — container paths when it runs in
+   *  Docker, which is why the download streams bytes rather than handing over a
+   *  path to copy by hand. */
+  paths: string[];
+  bytes: number | null;
+  filename: string | null;
+};
+
+/** Download URL for a session's source. Goes through artifactUrl so the token
+ *  rides as a query param — a browser-native download can't set headers. */
+export function sessionExportUrl(sessionId: string, agent: string): string {
+  return artifactUrl(
+    `/sessions/${encodeURIComponent(sessionId)}/export?agent=${encodeURIComponent(agent)}`
+  );
+}
+
 /** Like fetch(API_BASE + path) but attaches the access token and turns a 401
  *  into the auth-required signal. Returns the raw Response so callers that read
  *  .json()/.text() themselves keep working; it throws AuthRequiredError on 401

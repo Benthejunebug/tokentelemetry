@@ -1,6 +1,24 @@
 {
   "releases": [
     {
+      "tag": "2026-09-06",
+      "title": "Export any session, and error counts you can trust",
+      "highlights": [
+        {
+          "title": "Export a session from the trace page",
+          "description": "An Export button on any session downloads the file the trace is read from, byte for byte, for all 18 agents. Sessions kept as rows in a shared database (Hermes, OpenCode) have no such file, so those download as a reconstruction of just that session's rows and say so in the filename. Hovering shows the exact source path first, and when TokenTelemetry runs in a container without that agent's directory mounted it tells you which line of compose.yml to uncomment."
+        },
+        {
+          "title": "Error counts stopped counting the word \"error\"",
+          "description": "A session's header and its brief disagreed — 2 against 8 — because each searched trace text for words like \"error\" and \"exception\". Both counted tool results that merely mentioned failure: a tool listing its own error codes, a scraped web page. Both now read one structural check, and a session with a single real failure reports 1 in both places."
+        },
+        {
+          "title": "Hermes sessions show every model they used",
+          "description": "Hermes switches models mid-session, but the trace showed only the last one configured. Sessions now list every model actually called, in the order they were used."
+        }
+      ]
+    },
+    {
       "tag": "2026-09-04",
       "title": "The menu bar command opens the new panel",
       "highlights": [
