@@ -9707,7 +9707,11 @@ def _session_source(agent: str, session_id: str) -> Dict[str, Any]:
                         continue
                     match = list(bucket.glob(f"*{session_id}*.jsonl"))
                     if match:
-                        return _export_files(match[:1])
+                        # Guarded: a file can vanish between the glob and the
+                        # stat, and an unguarded _export_files would return a
+                        # dict with no "kind" for the endpoint to read.
+                        return _export_files(match[:1]) \
+                            or _export_unavailable(agent, "session file disappeared")
             return _export_unavailable(agent, "no session file found")
 
         if agent == "dsh":
@@ -9760,7 +9764,8 @@ def _session_source(agent: str, session_id: str) -> Dict[str, Any]:
                 header = next((r for r in rows
                                if isinstance(r, dict) and r.get("type") == "session"), None)
                 if isinstance(header, dict) and header.get("id") == session_id:
-                    return _export_files([candidate])
+                    return _export_files([candidate]) \
+                        or _export_unavailable(agent, "session file disappeared")
             return _export_unavailable(agent, "no session file found")
 
         if agent == "qwen":

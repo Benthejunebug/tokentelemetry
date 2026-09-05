@@ -189,6 +189,29 @@ def test_unavailable_carries_a_reason_and_a_fix(client, tmp_path, monkeypatch):
     assert r.json()["detail"]["hint"]
 
 
+ALL_AGENTS = [
+    "claude", "codex", "grok", "pi", "dsh", "qoder", "antigravity", "gemini",
+    "muse", "prime", "qwen", "vibe", "cursor", "copilot", "smallcode", "cline",
+    "hermes", "opencode",
+]
+
+
+@pytest.mark.parametrize("agent", ALL_AGENTS)
+def test_every_agent_returns_a_well_formed_verdict(agent):
+    """The resolver must always answer with a readable `kind`.
+
+    Several branches used to `return _export_files(...)` unguarded, which yields
+    a dict with no "kind" when a file vanishes between the glob and the stat —
+    a 500 from the endpoint instead of an honest "unavailable".
+    """
+    src = main._session_source(agent, "definitely-not-a-real-session-id")
+    assert src["kind"] in {"file", "files", "serialized", "unavailable"}
+    if src["kind"] == "unavailable":
+        assert src["reason"] and src["hint"]
+    # _export_filename must cope with whatever the resolver returned.
+    main._export_filename(agent, "definitely-not-a-real-session-id", src)
+
+
 def test_unknown_agent_says_so_rather_than_pretending(client):
     info = client.get("/sessions/x/export-info", params={"agent": "notanagent"}).json()
     assert info["kind"] == "unavailable"
